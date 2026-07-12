@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+encoder_fp16.mlpackage/
+*.onnx
+*.npy
