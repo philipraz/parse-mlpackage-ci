@@ -1,0 +1,40 @@
+name: mlpackage-measure
+
+# Manual trigger (Actions tab -> Run workflow).
+on:
+  workflow_dispatch:
+
+jobs:
+  measure:
+    # Apple Silicon runner = has the Neural Engine, the closest proxy to the
+    # iPhone's Core ML residency. (macos-14/15 are arm64.)
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Convert encoder -> .mlpackage + ONNX (fp16)
+        run: python ci_mlpackage.py convert
+
+      # Separate steps so each load's peak RSS is measured in its own process.
+      - name: Measure NATIVE Core ML footprint
+        run: python ci_mlpackage.py measure-native
+
+      - name: Measure ORT CoreML-EP footprint
+        run: python ci_mlpackage.py measure-ort
+
+      - name: Upload .mlpackage
+        uses: actions/upload-artifact@v4
+        with:
+          name: encoder_fp16-mlpackage
+          path: encoder_fp16.mlpackage
+          if-no-files-found: warn
