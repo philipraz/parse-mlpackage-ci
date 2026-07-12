@@ -293,9 +293,9 @@ def precision_ab():
               f"NaN={int(np.isnan(h).sum())} Inf={int(np.isinf(h).sum())}", flush=True)
 
     print("\n===== ENCODER PRECISION A/B (vs PyTorch fp32, IDENTICAL input) =====")
-    for label, cu in [("coreml-cpuOnly", ct.ComputeUnit.cpuOnly),
-                      ("coreml-cpuAndGPU", ct.ComputeUnit.cpuAndGPU),
-                      ("coreml-all(ANE)", ct.ComputeUnit.all)]:
+    for label, cu in [("coreml-cpuOnly", ct.ComputeUnit.CPU_ONLY),
+                      ("coreml-cpuAndGPU", ct.ComputeUnit.CPU_AND_GPU),
+                      ("coreml-all(ANE)", ct.ComputeUnit.ALL)]:
         try:
             m = ct.models.MLModel(MLPKG, compute_units=cu)
             report(label, list(m.predict({"pixel_values": pv}).values())[0])
