@@ -37,6 +37,11 @@ jobs:
       - name: Encoder precision A/B (per-token + compute-unit sweep)
         run: python ci_mlpackage.py precision-ab
 
+      # Is the conversion gap fixable? fp32 ceiling + selective-fp16 (keep
+      # norms/softmax/reductions fp32, like ORT does).
+      - name: Precision-fix candidates (fp32 + selective-fp16)
+        run: python ci_mlpackage.py precision-fix
+
       # The REAL gate: decoded-output quality, native vs ORT encoder, on a fixed
       # corpus (a clean lease + a dense list that degenerates full-page).
       - name: Decoded-output A/B

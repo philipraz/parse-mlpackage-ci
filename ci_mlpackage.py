@@ -316,6 +316,54 @@ def precision_ab():
     print("    worst-token ≪ mean ⇒ a few catastrophic tokens that flip greedy decode.")
 
 
+def precision_fix():
+    """Is the fp16 conversion gap fixable? Convert two variants and measure vs
+    PyTorch: FLOAT32 (the faithfulness ceiling) and selective-fp16 that keeps the
+    fp16-unstable ops (norms/softmax/reductions) in fp32 — what ORT does, which is
+    why ORT is 0.997. If fp16-safe ≈ 0.99+, native is fixable AND stays small."""
+    import torch
+    import coremltools as ct
+
+    pv_np = np.load(INP)
+    ref = np.load(REF).astype(np.float32)
+    pv = torch.from_numpy(pv_np)
+    wrap = EncWrap.build()
+    with torch.no_grad():
+        wrap(pv)
+        traced = torch.jit.trace(wrap, pv)
+
+    def report(label, mlpath):
+        sz = sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(mlpath) for f in fs) / 1e6
+        m = ct.models.MLModel(mlpath, compute_units=ct.ComputeUnit.CPU_AND_GPU)
+        h = np.asarray(list(m.predict({"pixel_values": pv_np}).values())[0], np.float32)
+        r2 = ref.reshape(ref.shape[1], -1)
+        h2 = h.reshape(h.shape[1], -1)
+        den = np.linalg.norm(r2, axis=1) * np.linalg.norm(h2, axis=1) + 1e-9
+        pt = (r2 * h2).sum(1) / den
+        print(f"  {label:14} ({sz:5.0f}MB): cos={cosine(ref, h):.5f} "
+              f"tok[min={pt.min():.4f} <0.9={int((pt < 0.9).sum())}/{len(pt)}] MAE={np.abs(ref - h).mean():.4f}", flush=True)
+
+    common = dict(inputs=[ct.TensorType(name="pixel_values", shape=(1, 3, H, W))],
+                  minimum_deployment_target=ct.target.iOS16, convert_to="mlprogram")
+    print("\n===== PRECISION-FIX candidates (vs PyTorch fp32, identical input) =====")
+    try:
+        ct.convert(traced, compute_precision=ct.precision.FLOAT32, **common).save("enc_fp32.mlpackage")
+        report("fp32-ceiling", "enc_fp32.mlpackage")
+    except Exception as e:
+        print(f"  fp32-ceiling: ERROR {e}", flush=True)
+    SENSITIVE = {"layer_norm", "batch_norm", "instance_norm", "l2_norm",
+                 "reduce_mean", "reduce_sum", "reduce_l2_norm", "reduce_max",
+                 "rsqrt", "sqrt", "softmax", "gelu", "erf"}
+    try:
+        from coremltools.transform import FP16ComputePrecision
+        cp = FP16ComputePrecision(op_selector=lambda op: op.op_type not in SENSITIVE)
+        ct.convert(traced, compute_precision=cp, **common).save("enc_fp16_safe.mlpackage")
+        report("fp16-safe", "enc_fp16_safe.mlpackage")
+    except Exception as e:
+        print(f"  fp16-safe: ERROR {e}", flush=True)
+    print("  → fp32≈0.997 confirms it's precision (fixable); fp16-safe≈0.99 = the fix (small + faithful).")
+
+
 def leak_check(n=12):
     import coremltools as ct
     pv = np.load(INP) if os.path.exists(INP) else fixed_input()
@@ -333,7 +381,7 @@ def leak_check(n=12):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["convert", "measure-native", "measure-ort", "precision-ab", "decode-ab", "leak-check"])
+    ap.add_argument("cmd", choices=["convert", "measure-native", "measure-ort", "precision-ab", "precision-fix", "decode-ab", "leak-check"])
     cmd = ap.parse_args().cmd
     {"convert": convert, "measure-native": measure_native, "measure-ort": measure_ort,
-     "precision-ab": precision_ab, "decode-ab": decode_ab, "leak-check": leak_check}[cmd]()
+     "precision-ab": precision_ab, "precision-fix": precision_fix, "decode-ab": decode_ab, "leak-check": leak_check}[cmd]()
