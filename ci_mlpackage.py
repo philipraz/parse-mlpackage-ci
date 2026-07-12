@@ -194,6 +194,15 @@ def cer(a, b):
     return round(1 - difflib.SequenceMatcher(None, a2, b2).ratio(), 3)
 
 
+def strip_markup(text):
+    """Text-only: drop coordinate tokens + class/format tags so CER measures
+    RECOGNITION divergence, not coordinate jitter (a tiny box change = many chars)."""
+    import re
+    t = re.sub(r"<x_[0-9.]+>|<y_[0-9.]+>|<class_[A-Za-z-]+>|<br>|</?sup>", " ", text)
+    t = re.sub(r"\\begin\{tabular\}\{[^}]*\}|\\end\{tabular\}|\\\\|&|#", " ", t)
+    return " ".join(t.split())
+
+
 def decode_ab():
     import torch
     import coremltools as ct
@@ -216,41 +225,98 @@ def decode_ab():
     def ort_hidden(pv):
         return ort_enc.run(None, {"pixel_values": pv})[0].astype(np.float32)
 
-    def decode(hidden, penalty=1.3, no_repeat=3, max_new=512):
+    def decode(hidden, penalty=1.3, no_repeat=3, max_new=256):
         try:
             enc = BaseModelOutput(last_hidden_state=torch.from_numpy(np.ascontiguousarray(hidden)))
             with torch.no_grad():
                 out = model.generate(encoder_outputs=enc, decoder_input_ids=prompt_ids,
+                                     decoder_attention_mask=torch.ones_like(prompt_ids),
                                      max_new_tokens=max_new, do_sample=False, num_beams=1,
                                      repetition_penalty=penalty, no_repeat_ngram_size=no_repeat,
                                      eos_token_id=EOS, pad_token_id=EOS, use_cache=True)
             gen = [int(x) for x in out[0][prompt_ids.shape[1]:]]
             text = proc.batch_decode([gen], skip_special_tokens=True)[0]
-            return text, len(gen), (EOS in gen)
+            # Distinguish the stop states — empty and cap are NOT "clean".
+            if len(gen) == 0 or (len(gen) == 1 and gen[0] == EOS):
+                st = "empty"
+            elif EOS in gen:
+                st = "eos"
+            elif len(gen) >= max_new:
+                st = "cap"
+            else:
+                st = "stop"
+            return text, len(gen), st
         except Exception as e:
-            return f"<decode error: {e}>", 0, False
+            return f"<decode error: {e}>", 0, "error"
 
-    print("\n===== DECODED-OUTPUT A/B (native Core ML vs ORT encoder, same decoder) =====")
-    print("decode: greedy, repetition_penalty=1.3, no_repeat_ngram_size=3, cap 512\n")
+    from collections import Counter
+    print("\n===== DECODED-OUTPUT A/B (native vs ORT encoder, SAME input + SAME decoder) =====")
     for name in TEST_IMAGES:
         img = Image.open(name).convert("RGB")
         pv = letterbox_pv(img)
-        nt, nn, ne = decode(native_hidden(pv))
-        ot, on, oe = decode(ort_hidden(pv))
+        nt, nn, ns = decode(native_hidden(pv))
+        ot, on, ostate = decode(ort_hidden(pv))
         print(f"--- {name} ({img.width}x{img.height}) FULL PAGE ---")
-        print(f"  NATIVE: {nn} tok EOS={ne} deg={degeneracy(nt)} | {nt[:150]!r}")
-        print(f"  ORT   : {on} tok EOS={oe} deg={degeneracy(ot)} | {ot[:150]!r}")
-        print(f"  native-vs-ort CER={cer(nt, ot)}")
-        # native full-page vs native 2x2 tiled (does tiling help the native encoder?)
-        clean = 0
+        print(f"  NATIVE: {nn} tok stop={ns} deg={degeneracy(nt)} | {nt[:140]!r}")
+        print(f"  ORT   : {on} tok stop={ostate} deg={degeneracy(ot)} | {ot[:140]!r}")
+        print(f"  CER  raw={cer(nt, ot)}  text-only={cer(strip_markup(nt), strip_markup(ot))}")
+        states = []
         for i, tile in enumerate(tiles_2x2(img)):
-            tt, tn, te = decode(native_hidden(letterbox_pv(tile)))
-            clean += te and degeneracy(tt) < 0.25
-            print(f"  NATIVE tile {i+1}/4: {tn} tok EOS={te} deg={degeneracy(tt)} | {tt[:80]!r}")
-        print(f"  NATIVE 2x2: {clean}/4 tiles clean\n")
+            tt, tn, ts = decode(native_hidden(letterbox_pv(tile)))
+            states.append(ts)
+            print(f"  NATIVE tile {i+1}/4: {tn} tok stop={ts} deg={degeneracy(tt)} | {tt[:70]!r}")
+        print(f"  NATIVE 2x2 stop-states: {dict(Counter(states))}  (only eos-with-content is a genuine parse)\n")
 
 
-def leak_check(n=20):
+def precision_ab():
+    """The KEY diagnostic (do this on ENCODER outputs before the decoder): is
+    native's degradation from ANE precision or from conversion? Feed the IDENTICAL
+    saved tensor to PyTorch/ORT/Core ML — no independent preprocessing — and report
+    the per-token distribution, not just a global cosine that hides worst tokens."""
+    import coremltools as ct
+    import onnxruntime as ort
+
+    pv = np.load(INP)
+    ref = np.load(REF).astype(np.float32)  # PyTorch fp32 [1, T, D]
+
+    def report(label, h):
+        h = np.asarray(h, np.float32)
+        if h.shape != ref.shape:
+            print(f"  {label:18}: SHAPE {h.shape} != ref {ref.shape}", flush=True); return
+        r2 = ref.reshape(ref.shape[1], -1)
+        h2 = h.reshape(h.shape[1], -1)
+        den = np.linalg.norm(r2, axis=1) * np.linalg.norm(h2, axis=1) + 1e-9
+        pt = (r2 * h2).sum(1) / den
+        print(f"  {label:18}: cos={cosine(ref, h):.5f} "
+              f"tok[min={pt.min():.4f} mean={pt.mean():.4f} p5={np.percentile(pt, 5):.4f} <0.9={int((pt < 0.9).sum())}/{len(pt)}] "
+              f"MAE={np.abs(ref - h).mean():.4f} maxAbs={np.abs(ref - h).max():.3f} "
+              f"NaN={int(np.isnan(h).sum())} Inf={int(np.isinf(h).sum())}", flush=True)
+
+    print("\n===== ENCODER PRECISION A/B (vs PyTorch fp32, IDENTICAL input) =====")
+    for label, cu in [("coreml-cpuOnly", ct.ComputeUnit.cpuOnly),
+                      ("coreml-cpuAndGPU", ct.ComputeUnit.cpuAndGPU),
+                      ("coreml-all(ANE)", ct.ComputeUnit.all)]:
+        try:
+            m = ct.models.MLModel(MLPKG, compute_units=cu)
+            report(label, list(m.predict({"pixel_values": pv}).values())[0])
+        except Exception as e:
+            print(f"  {label:18}: ERROR {e}", flush=True)
+    so = ort.SessionOptions(); so.log_severity_level = 3
+    provs = [p for p in ("CoreMLExecutionProvider", "CPUExecutionProvider") if p in ort.get_available_providers()]
+    try:
+        report("ort-" + provs[0].replace("ExecutionProvider", ""),
+               ort.InferenceSession(ONNX_FP16, so, providers=provs).run(None, {"pixel_values": pv})[0])
+    except Exception as e:
+        print(f"  ort: ERROR {e}", flush=True)
+    try:
+        report("ort-cpu", ort.InferenceSession(ONNX_FP16, so, providers=["CPUExecutionProvider"]).run(None, {"pixel_values": pv})[0])
+    except Exception as e:
+        print(f"  ort-cpu: ERROR {e}", flush=True)
+    print("  → cpuOnly≈ort but all≠ ⇒ ANE precision;  all coreml modes ≈each other but ≠ort ⇒ conversion;")
+    print("    worst-token ≪ mean ⇒ a few catastrophic tokens that flip greedy decode.")
+
+
+def leak_check(n=12):
     import coremltools as ct
     pv = np.load(INP) if os.path.exists(INP) else fixed_input()
     ml = ct.models.MLModel(MLPKG, compute_units=ct.ComputeUnit.ALL)
@@ -267,7 +333,7 @@ def leak_check(n=20):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["convert", "measure-native", "measure-ort", "decode-ab", "leak-check"])
+    ap.add_argument("cmd", choices=["convert", "measure-native", "measure-ort", "precision-ab", "decode-ab", "leak-check"])
     cmd = ap.parse_args().cmd
     {"convert": convert, "measure-native": measure_native, "measure-ort": measure_ort,
-     "decode-ab": decode_ab, "leak-check": leak_check}[cmd]()
+     "precision-ab": precision_ab, "decode-ab": decode_ab, "leak-check": leak_check}[cmd]()

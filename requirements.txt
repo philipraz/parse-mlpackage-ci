@@ -12,3 +12,5 @@ psutil
 timm
 einops
 open_clip_torch
+albumentations
+opencv-python-headless

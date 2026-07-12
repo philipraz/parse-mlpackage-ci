@@ -9,7 +9,7 @@ jobs:
     # Apple Silicon runner = has the Neural Engine, the closest proxy to the
     # iPhone's Core ML residency. (macos-14/15 are arm64.)
     runs-on: macos-14
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -31,6 +31,11 @@ jobs:
 
       - name: Measure ORT CoreML-EP footprint
         run: python ci_mlpackage.py measure-ort
+
+      # Localize the fidelity gap on ENCODER outputs (before the decoder): ANE
+      # precision vs conversion, per-token, on an identical input.
+      - name: Encoder precision A/B (per-token + compute-unit sweep)
+        run: python ci_mlpackage.py precision-ab
 
       # The REAL gate: decoded-output quality, native vs ORT encoder, on a fixed
       # corpus (a clean lease + a dense list that degenerates full-page).
