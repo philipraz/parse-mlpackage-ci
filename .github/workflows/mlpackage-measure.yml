@@ -32,6 +32,15 @@ jobs:
       - name: Measure ORT CoreML-EP footprint
         run: python ci_mlpackage.py measure-ort
 
+      # The REAL gate: decoded-output quality, native vs ORT encoder, on a fixed
+      # corpus (a clean lease + a dense list that degenerates full-page).
+      - name: Decoded-output A/B
+        run: python ci_mlpackage.py decode-ab
+
+      # Does native Core ML retain memory per run (the ORT failure mode)?
+      - name: Leak check (20 sequential predicts)
+        run: python ci_mlpackage.py leak-check
+
       - name: Upload .mlpackage
         uses: actions/upload-artifact@v4
         with:

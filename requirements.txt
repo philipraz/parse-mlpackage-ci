@@ -1,13 +1,14 @@
-torch
+# Pinned to the versions that converted all 985 ops locally — newer torch/
+# coremltools produce a traced graph that trips a coremltools int-cast bug
+# (TypeError: only 0-dimensional arrays can be converted to Python scalars).
+torch==2.5.1
 transformers==4.51.3
-coremltools>=9.0
+coremltools==9.0
+numpy==2.2.3
 onnx
 onnxruntime
-numpy
 pillow
 psutil
 timm
 einops
-safetensors
-sentencepiece
-accelerate
+open_clip_torch
