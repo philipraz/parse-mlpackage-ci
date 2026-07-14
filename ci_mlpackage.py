@@ -252,6 +252,9 @@ def decode_ab():
     from collections import Counter
     print("\n===== DECODED-OUTPUT A/B (native vs ORT encoder, SAME input + SAME decoder) =====")
     for name in TEST_IMAGES:
+        if not os.path.exists(name):
+            print(f"  (skip {name} — not in repo)", flush=True)
+            continue
         img = Image.open(name).convert("RGB")
         pv = letterbox_pv(img)
         nt, nn, ns = decode(native_hidden(pv))
