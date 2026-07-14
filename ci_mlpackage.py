@@ -367,6 +367,95 @@ def precision_fix():
     print("  → fp32=1.0 confirmed it's pure precision; fp16-safe≈0.99 = the fix (small + faithful).")
 
 
+def precision_probe():
+    """fp32 is perfect (cos 1.0), yet blanket-fp16 (0.958) AND
+    norms/softmax/reductions-in-fp32 (0.962) both fail. So the fp16-unstable op is
+    NOT in that family. Localize it in ONE run, two ways:
+
+      (A) by op-TYPE — keep exactly one op_type in fp32 (rest fp16); the type whose
+          protection jumps cos toward 1.0 is the culprit family.
+      (B) by graph POSITION — keep the back-half / back-quarter of ops in fp32; if
+          only the deep tail matters, that's ViT-H residual-stream growth overflowing
+          fp16 (activations exceed 65504 in late layers), not a single op type.
+
+    Whichever recovers cos becomes the shipping recipe's fp32 carve-out."""
+    import torch
+    import coremltools as ct
+    from coremltools.converters.mil.mil.passes.defs.quantization import FP16ComputePrecision
+    from collections import Counter
+
+    pv_np = np.load(INP)
+    ref = np.load(REF).astype(np.float32)
+    pv = torch.from_numpy(pv_np)
+    wrap = EncWrap.build()
+    with torch.no_grad():
+        wrap(pv)
+        traced = torch.jit.trace(wrap, pv)
+
+    common = dict(inputs=[ct.TensorType(name="pixel_values", shape=(1, 3, H, W))],
+                  minimum_deployment_target=ct.target.iOS16, convert_to="mlprogram")
+
+    def measure(mlpath):
+        m = ct.models.MLModel(mlpath, compute_units=ct.ComputeUnit.CPU_AND_GPU)
+        h = np.asarray(list(m.predict({"pixel_values": pv_np}).values())[0], np.float32)
+        return cosine(ref, h)
+
+    def conv_cos(label, op_selector):
+        try:
+            cp = FP16ComputePrecision(op_selector=op_selector)
+            path = f"probe_{label}.mlpackage"
+            ct.convert(traced, compute_precision=cp, **common).save(path)
+            c = measure(path)
+            print(f"    {label:22} cos={c:.5f}", flush=True)
+            return (label, c)
+        except Exception as e:
+            print(f"    {label:22} ERROR {e}", flush=True)
+            return (label, -1.0)
+
+    # Op names/types in execution order (structure is precision-independent).
+    ordered = []
+    try:
+        prog = ct.convert(traced, convert_to="milinternal",
+                          inputs=[ct.TensorType(name="pixel_values", shape=(1, 3, H, W))],
+                          minimum_deployment_target=ct.target.iOS16)
+        ordered = [(o.name, o.op_type) for o in prog.functions["main"].operations]
+    except Exception as e:
+        print(f"  (milinternal introspection failed: {e})", flush=True)
+    hist = Counter(t for _, t in ordered)
+    if hist:
+        print("\n===== OP-TYPE HISTOGRAM (top 30) =====", flush=True)
+        for t, c in hist.most_common(30):
+            print(f"    {c:5d}  {t}", flush=True)
+
+    results = []
+    print("\n===== (A) SINGLE-OP-TYPE fp32 PROBE (keep ONE type fp32, rest fp16) =====", flush=True)
+    SUSPECTS = ["add", "matmul", "mul", "linear", "conv", "einsum", "sub",
+                "softmax", "gelu", "erf", "layer_norm", "batch_norm",
+                "reduce_mean", "real_div", "sqrt", "rsqrt", "scaled_dot_product_attention"]
+    cands = [t for t in SUSPECTS if not hist or t in hist]
+    for t in cands:
+        results.append(conv_cos(f"type={t}", lambda op, _t=t: op.op_type != _t))
+
+    if ordered:
+        print("\n===== (B) POSITIONAL fp32 PROBE (keep a contiguous slab fp32) =====", flush=True)
+        names = [n for n, _ in ordered]
+        N = len(names)
+        for label, keep in [
+            ("back-50%", set(names[N // 2:])),
+            ("back-25%", set(names[3 * N // 4:])),
+            ("front-50%", set(names[:N // 2])),
+        ]:
+            results.append(conv_cos(label, lambda op, _k=keep: op.name not in _k))
+
+    results = [r for r in results if r[1] >= 0]
+    results.sort(key=lambda x: -x[1])
+    print("\n  RANK (best first):", flush=True)
+    for label, c in results:
+        print(f"    {c:.5f}  {label}", flush=True)
+    print("  → a TYPE at ~0.99 ⇒ add it to SENSITIVE; only POSITION recovers ⇒ deep", flush=True)
+    print("    residual overflow ⇒ carve out the back slab (or raise its accum to fp32).", flush=True)
+
+
 def leak_check(n=12):
     import coremltools as ct
     pv = np.load(INP) if os.path.exists(INP) else fixed_input()
@@ -384,7 +473,8 @@ def leak_check(n=12):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["convert", "measure-native", "measure-ort", "precision-ab", "precision-fix", "decode-ab", "leak-check"])
+    ap.add_argument("cmd", choices=["convert", "measure-native", "measure-ort", "precision-ab", "precision-fix", "precision-probe", "decode-ab", "leak-check"])
     cmd = ap.parse_args().cmd
     {"convert": convert, "measure-native": measure_native, "measure-ort": measure_ort,
-     "precision-ab": precision_ab, "precision-fix": precision_fix, "decode-ab": decode_ab, "leak-check": leak_check}[cmd]()
+     "precision-ab": precision_ab, "precision-fix": precision_fix, "precision-probe": precision_probe,
+     "decode-ab": decode_ab, "leak-check": leak_check}[cmd]()
