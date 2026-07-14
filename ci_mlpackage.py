@@ -358,13 +358,13 @@ def precision_fix():
                  "reduce_mean", "reduce_sum", "reduce_l2_norm", "reduce_max",
                  "rsqrt", "sqrt", "softmax", "gelu", "erf"}
     try:
-        from coremltools.transform import FP16ComputePrecision
+        from coremltools.converters.mil.mil.passes.defs.quantization import FP16ComputePrecision
         cp = FP16ComputePrecision(op_selector=lambda op: op.op_type not in SENSITIVE)
         ct.convert(traced, compute_precision=cp, **common).save("enc_fp16_safe.mlpackage")
         report("fp16-safe", "enc_fp16_safe.mlpackage")
     except Exception as e:
         print(f"  fp16-safe: ERROR {e}", flush=True)
-    print("  → fp32≈0.997 confirms it's precision (fixable); fp16-safe≈0.99 = the fix (small + faithful).")
+    print("  → fp32=1.0 confirmed it's pure precision; fp16-safe≈0.99 = the fix (small + faithful).")
 
 
 def leak_check(n=12):
