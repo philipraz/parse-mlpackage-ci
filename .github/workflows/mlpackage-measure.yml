@@ -12,27 +12,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-
-Two files to sync to GitHub, then one run:
-
-1. Upload ci_mlpackage.py (drag-and-drop, has the new ship-candidate command).
-
-2. Replace .github/workflows/mlpackage-measure.yml (browser pencil → select-all → paste this):
-
-name: mlpackage-measure
-
-# Manual trigger (Actions tab -> Run workflow).
-on:
-  workflow_dispatch:
-
-jobs:
-  measure:
-    # Apple Silicon runner = has the Neural Engine, closest proxy to the iPhone.
-    runs-on: macos-14
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -48,11 +27,11 @@ jobs:
 
       # THE FIX: keep `linear` ops fp32 (probe found 0.958->0.996). Saves it as the
       # canonical encoder_fp16.mlpackage; reports cos + disk + in-process resident.
-      - name: Ship candidate (linear-fp32) cos + size +
+      - name: Ship candidate (linear-fp32) cos + size + resident
         run: python ci_mlpackage.py ship-candidate
 
       # Resident RSS in a fresh process (cleanest number for the jetsam question).
-      - name: Measure NATIVE Core ML footprint (fresh p
+      - name: Measure NATIVE Core ML footprint (fresh process)
         run: python ci_mlpackage.py measure-native
 
       # Per-run retention (the ORT failure mode) on the ship candidate.
@@ -65,4 +44,3 @@ jobs:
           name: encoder_linear-fp32-mlpackage
           path: encoder_fp16.mlpackage
           if-no-files-found: warn
-          
