@@ -6,8 +6,7 @@ on:
 
 jobs:
   measure:
-    # Apple Silicon runner = has the Neural Engine, the closest proxy to the
-    # iPhone's Core ML residency. (macos-14/15 are arm64.)
+    # Apple Silicon runner = has the Neural Engine, closest proxy to the iPhone.
     runs-on: macos-14
     timeout-minutes: 120
     steps:
@@ -22,38 +21,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Convert encoder -> .mlpackage + ONNX (fp16)
+      # Produces input_pv.npy + ref_hidden.npy (the fixed input + PyTorch fp32 ref).
+      - name: Convert encoder + reference tensors
         run: python ci_mlpackage.py convert
 
-      # Separate steps so each load's peak RSS is measured in its own process.
-      - name: Measure NATIVE Core ML footprint
-        run: python ci_mlpackage.py measure-native
-
-      - name: Measure ORT CoreML-EP footprint
-        run: python ci_mlpackage.py measure-ort
-
-      # Localize the fidelity gap on ENCODER outputs (before the decoder): ANE
-      # precision vs conversion, per-token, on an identical input.
-      - name: Encoder precision A/B (per-token + compute-unit sweep)
-        run: python ci_mlpackage.py precision-ab
-
-      # Is the conversion gap fixable? fp32 ceiling + selective-fp16 (keep
-      # norms/softmax/reductions fp32, like ORT does).
+      # fp16-safe didn't recover (0.962): the bad op isn't norms/softmax/reductions.
+      # Localize it — per op-type AND per graph position (deep-residual overflow).
       - name: Precision probe (localize the fp16-unstable op)
-     run: python ci_mlpackage.py precision-probe
-
-      # The REAL gate: decoded-output quality, native vs ORT encoder, on a fixed
-      # corpus (a clean lease + a dense list that degenerates full-page).
-      - name: Decoded-output A/B
-        run: python ci_mlpackage.py decode-ab
-
-      # Does native Core ML retain memory per run (the ORT failure mode)?
-      - name: Leak check (20 sequential predicts)
-        run: python ci_mlpackage.py leak-check
-
-      - name: Upload .mlpackage
-        uses: actions/upload-artifact@v4
-        with:
-          name: encoder_fp16-mlpackage
-          path: encoder_fp16.mlpackage
-          if-no-files-found: warn
+        run: python ci_mlpackage.py precision-probe
+        
