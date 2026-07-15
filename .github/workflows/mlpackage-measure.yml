@@ -25,20 +25,32 @@ jobs:
       - name: Convert encoder + reference tensors
         run: python ci_mlpackage.py convert
 
-      # THE FIX: keep `linear` ops fp32 (probe found 0.958->0.996). Saves it as the
-      # canonical encoder_fp16.mlpackage; reports cos + disk + in-process resident.
+      # THE FIX: keep `linear` ops fp32 (0.958->0.996). Saves canonical
+      # encoder_fp16.mlpackage; reports cos + disk + in-process resident.
       - name: Ship candidate (linear-fp32) cos + size + resident
         run: python ci_mlpackage.py ship-candidate
-
-      # Resident RSS in a fresh process (cleanest number for the jetsam question).
-      - name: Measure NATIVE Core ML footprint (fresh process)
-        run: python ci_mlpackage.py measure-native
 
       # Per-run retention (the ORT failure mode) on the ship candidate.
       - name: Leak check (sequential predicts)
         run: python ci_mlpackage.py leak-check
 
-      - name: Upload ship-candidate .mlpackage
+      # Precompile -> .mlmodelc so the phone NEVER runtime-compiles (that's the
+      # ~5.5GB peak spike that would jetsam the first launch). Side-load THIS.
+      - name: Precompile .mlmodelc
+        run: |
+          rm -rf mlmodelc_out && mkdir mlmodelc_out
+          xcrun coremlcompiler compile encoder_fp16.mlpackage mlmodelc_out
+          echo "=== compiled output ===" && ls -la mlmodelc_out
+          du -sh mlmodelc_out/* || true
+
+      - name: Upload precompiled .mlmodelc (side-load this)
+        uses: actions/upload-artifact@v4
+        with:
+          name: encoder_linear-fp32-mlmodelc
+          path: mlmodelc_out
+          if-no-files-found: warn
+
+      - name: Upload ship-candidate .mlpackage (backup)
         uses: actions/upload-artifact@v4
         with:
           name: encoder_linear-fp32-mlpackage
