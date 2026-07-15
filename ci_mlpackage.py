@@ -400,10 +400,12 @@ def precision_probe():
         h = np.asarray(list(m.predict({"pixel_values": pv_np}).values())[0], np.float32)
         return cosine(ref, h)
 
+    import shutil
+
     def conv_cos(label, op_selector):
+        path = f"probe_{label}.mlpackage"
         try:
             cp = FP16ComputePrecision(op_selector=op_selector)
-            path = f"probe_{label}.mlpackage"
             ct.convert(traced, compute_precision=cp, **common).save(path)
             c = measure(path)
             print(f"    {label:22} cos={c:.5f}", flush=True)
@@ -411,6 +413,8 @@ def precision_probe():
         except Exception as e:
             print(f"    {label:22} ERROR {e}", flush=True)
             return (label, -1.0)
+        finally:
+            shutil.rmtree(path, ignore_errors=True)  # don't fill the runner disk
 
     # Op names/types in execution order (structure is precision-independent).
     ordered = []
@@ -456,6 +460,49 @@ def precision_probe():
     print("    residual overflow ⇒ carve out the back slab (or raise its accum to fp32).", flush=True)
 
 
+def ship_candidate():
+    """THE FIX (localized by precision-probe): keep `linear` ops in fp32, rest fp16
+    → cos 0.958→0.996. Build it as the canonical encoder_fp16.mlpackage so the
+    downstream steps (measure-native / leak-check / decode-ab) all test THIS model,
+    and report the tradeoff that actually decides shipping: cosine, disk size, and
+    resident RSS (linear holds ~all the weights, so this is bigger than blanket-fp16
+    — the question is whether it still clears the on-device jetsam ceiling)."""
+    import torch
+    import coremltools as ct
+    from coremltools.converters.mil.mil.passes.defs.quantization import FP16ComputePrecision
+
+    pv_np = np.load(INP)
+    ref = np.load(REF).astype(np.float32)
+    pv = torch.from_numpy(pv_np)
+    wrap = EncWrap.build()
+    with torch.no_grad():
+        wrap(pv)
+        traced = torch.jit.trace(wrap, pv)
+
+    KEEP_FP32 = {"linear"}
+    cp = FP16ComputePrecision(op_selector=lambda op: op.op_type not in KEEP_FP32)
+    t0 = time.time()
+    ml = ct.convert(traced, compute_precision=cp,
+                    inputs=[ct.TensorType(name="pixel_values", shape=(1, 3, H, W))],
+                    minimum_deployment_target=ct.target.iOS16, convert_to="mlprogram")
+    ml.save(MLPKG)
+    sz = sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(MLPKG) for f in fs) / 1e6
+
+    cur0, _ = rss_mb()
+    m = ct.models.MLModel(MLPKG, compute_units=ct.ComputeUnit.ALL)
+    h = np.asarray(list(m.predict({"pixel_values": pv_np}).values())[0], np.float32)
+    cur, peak = rss_mb()
+    r2, h2 = ref.reshape(ref.shape[1], -1), h.reshape(h.shape[1], -1)
+    den = np.linalg.norm(r2, axis=1) * np.linalg.norm(h2, axis=1) + 1e-9
+    pt = (r2 * h2).sum(1) / den
+    print(f"\n===== SHIP CANDIDATE: linear-fp32 (saved as {MLPKG}) =====", flush=True)
+    print(f"  cos={cosine(ref, h):.5f}  tok[min={pt.min():.4f} <0.9={int((pt < 0.9).sum())}/{len(pt)}]  "
+          f"MAE={np.abs(ref - h).mean():.4f}", flush=True)
+    print(f"  disk={sz:.0f}MB  resident_rss={cur:.0f}MB  peak={peak:.0f}MB  "
+          f"(load+predict delta {cur-cur0:.0f}MB)  convert {time.time()-t0:.0f}s", flush=True)
+    print(f"  → gate: resident must clear the on-device jetsam ceiling; vs ORT ~4.5GB.", flush=True)
+
+
 def leak_check(n=12):
     import coremltools as ct
     pv = np.load(INP) if os.path.exists(INP) else fixed_input()
@@ -473,8 +520,8 @@ def leak_check(n=12):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["convert", "measure-native", "measure-ort", "precision-ab", "precision-fix", "precision-probe", "decode-ab", "leak-check"])
+    ap.add_argument("cmd", choices=["convert", "measure-native", "measure-ort", "precision-ab", "precision-fix", "precision-probe", "ship-candidate", "decode-ab", "leak-check"])
     cmd = ap.parse_args().cmd
     {"convert": convert, "measure-native": measure_native, "measure-ort": measure_ort,
      "precision-ab": precision_ab, "precision-fix": precision_fix, "precision-probe": precision_probe,
-     "decode-ab": decode_ab, "leak-check": leak_check}[cmd]()
+     "ship-candidate": ship_candidate, "decode-ab": decode_ab, "leak-check": leak_check}[cmd]()
